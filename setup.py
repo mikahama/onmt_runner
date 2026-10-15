@@ -14,7 +14,7 @@ requirements = [
 
 setup(
     name="onmt-runner",
-    version="1.0.0",
+    version="1.5.0",
     description="Standalone inference for legacy OpenNMT-py recurrent checkpoints",
     long_description=(ROOT / "README.md").read_text(encoding="utf-8"),
 

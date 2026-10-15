@@ -22,6 +22,14 @@ class UnsupportedCheckpointError(ValueError):
     """The checkpoint is valid, but uses an architecture not yet supported."""
 
 
+@dataclass(frozen=True)
+class Prediction:
+    """A translated hypothesis with normalized and raw log-probability."""
+    text: str
+    score: float
+    raw_score: float
+
+
 class _PicklePlaceholder:
     """Receives state for obsolete OpenNMT/torchtext metadata classes."""
 
@@ -210,11 +218,20 @@ class Translator:
         *,
         max_length: int = 100,
         detokenize: Callable[[list[str]], str] | None = None,
-        beam_size: int = 1,
-    ) -> list[str]:
-        """Translate pre-tokenized strings.  Beam search is intentionally pending."""
-        if beam_size != 1:
-            raise NotImplementedError("beam search is not implemented yet; use beam_size=1")
+        beam_size: int | None = None,
+        n_best: int = 1,
+        return_scores: bool = False,
+        length_penalty: str = "none",
+        alpha: float = 0.0,
+    ) -> list[str] | list[list[str]]:
+        """Translate pre-tokenized strings, optionally returning ranked hypotheses."""
+        beam_size = max(1, n_best) if beam_size is None else beam_size
+        if n_best < 1 or beam_size < 1:
+            raise ValueError("n_best and beam_size must be positive")
+        if n_best > beam_size:
+            raise ValueError("n_best cannot exceed beam_size")
+        if length_penalty not in {"none", "wu", "avg"}:
+            raise ValueError("length_penalty must be 'none', 'wu', or 'avg'")
         if max_length < 1:
             raise ValueError("max_length must be positive")
         if not texts:
@@ -222,6 +239,10 @@ class Translator:
         words = [text.split() for text in texts]
         if any(not sentence for sentence in words):
             raise ValueError("each source sentence must contain at least one token")
+        if beam_size > 1 or return_scores:
+            join = detokenize or (lambda tokens: " ".join(tokens))
+            translations = [self._beam_translate(sentence, max_length, beam_size, n_best, join, return_scores, length_penalty, alpha) for sentence in words]
+            return translations if n_best > 1 else [translation[0] for translation in translations]
         lengths = torch.tensor([len(sentence) for sentence in words], device=self.device)
         max_source = int(lengths.max())
         source = torch.full((max_source, len(words)), self.src_stoi["<blank>"], dtype=torch.long, device=self.device)
@@ -244,10 +265,68 @@ class Translator:
             if bool(finished.all()):
                 break
         join = detokenize or (lambda tokens: " ".join(tokens))
-        return [join(tokens) for tokens in results]
+        texts = [join(tokens) for tokens in results]
+        return [Prediction(text, 0.0, 0.0) for text in texts] if return_scores else texts
 
-    def translate(self, text: str, **kwargs: Any) -> str:
-        """Translate one pre-tokenized sentence."""
+    def _beam_translate(
+        self,
+        sentence: list[str],
+        max_length: int,
+        beam_size: int,
+        n_best: int,
+        join: Callable[[list[str]], str],
+        return_scores: bool,
+        length_penalty: str,
+        alpha: float,
+    ) -> list[Any]:
+        """Run independent beam search for one sentence.
+
+        Keeping each hypothesis' decoder state separate avoids depending on
+        the old OpenNMT beam-search implementation and its removed classes.
+        """
+        source = torch.tensor(
+            [[self.src_stoi.get(token, self.unk_id)] for token in sentence], dtype=torch.long, device=self.device
+        )
+        lengths = torch.tensor([len(sentence)], device=self.device)
+        memory, encoder_hidden = self.model.encode(source, lengths)
+        source_mask = torch.ones((1, len(sentence)), dtype=torch.bool, device=self.device)
+        initial = self.model.initial_state(encoder_hidden)
+        # (last input token, generated tokens, cumulative log probability, decoder state)
+        active: list[tuple[int, list[int], float, _DecoderState]] = [(self.bos_id, [], 0.0, initial)]
+        finished: list[tuple[list[int], float]] = []
+        for _ in range(max_length):
+            candidates: list[tuple[int, list[int], float, _DecoderState]] = []
+            for last_token, tokens, score, state in active:
+                token = torch.tensor([last_token], dtype=torch.long, device=self.device)
+                log_probs, next_state = self.model.step(token, state, memory, source_mask)
+                values, ids = torch.topk(log_probs[0], beam_size)
+                for value, token_id in zip(values.tolist(), ids.tolist()):
+                    next_tokens = tokens + [token_id]
+                    next_score = score + value
+                    if token_id == self.eos_id:
+                        finished.append((tokens, next_score))
+                    else:
+                        candidates.append((token_id, next_tokens, next_score, next_state))
+            candidates.sort(key=lambda candidate: self._score(candidate[2], len(candidate[1]), length_penalty, alpha), reverse=True)
+            active = candidates[:beam_size]
+            if not active:
+                break
+        ranked = finished + [(tokens, score) for _, tokens, score, _ in active]
+        ranked.sort(key=lambda candidate: self._score(candidate[1], len(candidate[0]), length_penalty, alpha), reverse=True)
+        if not ranked:
+            ranked = [([], float("-inf"))]
+        return [Prediction(join([self.tgt_tokens[token_id] for token_id in tokens]), self._score(raw, len(tokens), length_penalty, alpha), raw) if return_scores else join([self.tgt_tokens[token_id] for token_id in tokens]) for tokens, raw in ranked[:n_best]]
+
+    @staticmethod
+    def _score(raw_score: float, length: int, penalty: str, alpha: float) -> float:
+        if penalty == "wu":
+            return raw_score / (((5.0 + length) / 6.0) ** alpha)
+        if penalty == "avg":
+            return raw_score / (max(length, 1) ** alpha)
+        return raw_score
+
+    def translate(self, text: str, **kwargs: Any) -> str | list[str]:
+        """Translate one pre-tokenized sentence; return a list when ``n_best > 1``."""
         return self.translate_many([text], **kwargs)[0]
 
 
@@ -306,9 +385,17 @@ class TensorFlowTranslator:
         texts: Sequence[str],
         *,
         detokenize: Callable[[list[str]], str] | None = None,
+        n_best: int = 1,
+        return_scores: bool = False,
         **_: Any,
-    ) -> list[str]:
-        """Translate pre-tokenized strings using the exported serving graph."""
+    ) -> list[str] | list[list[str]]:
+        """Translate pre-tokenized strings using the exported serving graph.
+
+        SavedModel exports choose their beam width at export time. ``n_best``
+        selects from those returned, already-ranked hypotheses.
+        """
+        if n_best < 1:
+            raise ValueError("n_best must be positive")
         if not texts:
             return []
         tokenized = [text.split() for text in texts]
@@ -327,6 +414,8 @@ class TensorFlowTranslator:
         if "tokens" not in outputs:
             raise UnsupportedCheckpointError("OpenNMT-tf serving signature did not return `tokens`")
         values = outputs["tokens"].numpy()
+        model_scores = outputs.get("log_probs")
+        score_values = model_scores.numpy().tolist() if model_scores is not None else None
         lengths = outputs.get("length")
         if lengths is None:
             output_lengths = [len(row) for row in values]
@@ -334,22 +423,27 @@ class TensorFlowTranslator:
             length_values = lengths.numpy()
             output_lengths = length_values.tolist() if hasattr(length_values, "tolist") else list(length_values)
         join = detokenize or (lambda tokens: " ".join(tokens))
-        results: list[str] = []
-        for row, length in zip(values, output_lengths):
-            # OpenNMT-tf exports [batch, n_best, time]. This API returns the
-            # highest-ranked hypothesis and hides its terminal </s> marker.
-            if len(row) and not isinstance(row[0], (bytes, str)):
-                row = row[0]
-            if isinstance(length, (list, tuple)):
-                length = length[0]
-            tokens = [token.decode("utf-8") if isinstance(token, bytes) else str(token) for token in row[: int(length)]]
-            if tokens and tokens[-1] == "</s>":
-                tokens.pop()
-            results.append(join(tokens))
-        return results
+        results: list[list[Any]] = []
+        for batch_index, (row, length) in enumerate(zip(values, output_lengths)):
+            # OpenNMT-tf exports [batch, n_best, time], while exports with a
+            # single hypothesis may omit the middle dimension.
+            hypotheses = row if len(row) and not isinstance(row[0], (bytes, str)) else [row]
+            lengths_for_row = length if isinstance(length, (list, tuple)) else [length]
+            if n_best > len(hypotheses):
+                raise ValueError(f"SavedModel returned only {len(hypotheses)} hypotheses; n_best={n_best} was requested")
+            translations: list[str] = []
+            for hypothesis, hypothesis_length in zip(hypotheses[:n_best], lengths_for_row[:n_best]):
+                tokens = [token.decode("utf-8") if isinstance(token, bytes) else str(token) for token in hypothesis[: int(hypothesis_length)]]
+                if tokens and tokens[-1] == "</s>":
+                    tokens.pop()
+                text = join(tokens)
+                raw_score = float(score_values[batch_index][len(translations)]) if score_values is not None else 0.0
+                translations.append(Prediction(text, raw_score, raw_score) if return_scores else text)
+            results.append(translations)
+        return results if n_best > 1 else [result[0] for result in results]
 
-    def translate(self, text: str, **kwargs: Any) -> str:
-        """Translate one pre-tokenized sentence."""
+    def translate(self, text: str, **kwargs: Any) -> str | list[str]:
+        """Translate one pre-tokenized sentence; return a list when ``n_best > 1``."""
         return self.translate_many([text], **kwargs)[0]
 
 
