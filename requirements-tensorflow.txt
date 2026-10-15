@@ -1,0 +1,2 @@
+# Optional runtime for OpenNMT-tf SavedModel directories.
+tensorflow>=2.16
