@@ -17,6 +17,16 @@ setup(
     version="1.0.0",
     description="Standalone inference for legacy OpenNMT-py recurrent checkpoints",
     long_description=(ROOT / "README.md").read_text(encoding="utf-8"),
+
+    # The project's main homepage.
+    url='https://github.com/mikahama/onmt_runner',
+
+    # Author details
+    author='Mika Hämäläinen',
+
+    # Choose your license
+    license='Apache 2.0',
+
     long_description_content_type="text/markdown",
     python_requires=">=3.10",
     packages=find_packages(exclude=("tests", "tests.*")),
